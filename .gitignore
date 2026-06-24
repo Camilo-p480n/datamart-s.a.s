@@ -1,0 +1,33 @@
+# Variables de entorno reales (NUNCA al repositorio)
+.env
+
+# Logs de Airflow
+logs/
+*.log
+
+
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Docker volumes locales
+airflow-db-data/
+datamart-db-data/
+
+# Archivos de datos (demasiado grandes para git)
+data/*.parquet
+
+# Parquets temporales del pipeline
+data/_tmp_*.parquet

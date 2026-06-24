@@ -1,0 +1,219 @@
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  build: .
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-db:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: 60
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_SECRET_KEY}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+    DW_HOST: datamart-db
+    DW_PORT: 5432
+    DW_NAME: ${DW_DB_NAME}
+    DW_USER: ${DW_DB_USER}
+    DW_PASSWORD: ${DW_DB_PASSWORD}
+    AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER}
+    AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+    AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./plugins:/opt/airflow/plugins
+    - ./data:/opt/airflow/data
+    - ./sql:/opt/airflow/sql
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    airflow-db:
+      condition: service_healthy
+    datamart-db:
+      condition: service_healthy
+  networks:
+    - datamart-net
+
+services:
+
+  airflow-db:
+    image: postgres:15
+    container_name: airflow-db
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${AIRFLOW_DB_USER}", "-d", "${AIRFLOW_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - datamart-net
+    restart: unless-stopped
+
+  datamart-db:
+    image: postgres:15
+    container_name: datamart-db
+    environment:
+      POSTGRES_USER: ${DW_DB_USER}
+      POSTGRES_PASSWORD: ${DW_DB_PASSWORD}
+      POSTGRES_DB: ${DW_DB_NAME}
+    volumes:
+      - datamart-db-data:/var/lib/postgresql/data
+      - ./sql/init_datamart.sql:/docker-entrypoint-initdb.d/01_init_datamart.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${DW_DB_USER}", "-d", "${DW_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    ports:
+      - "5434:5432"
+    networks:
+      - datamart-net
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        echo "━━━ [1/4] Migrando base de datos de Airflow ━━━"
+        airflow db migrate
+
+        echo "━━━ [2/4] Creando usuario administrador ━━━"
+        airflow users create \
+          --role Admin \
+          --username "${AIRFLOW_ADMIN_USER}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname Admin \
+          --lastname DataMart \
+          --email "${AIRFLOW_ADMIN_EMAIL}" \
+          2>/dev/null || echo "  → Usuario '${AIRFLOW_ADMIN_USER}' ya existe, omitiendo."
+        echo "  ✓ Usuario '${AIRFLOW_ADMIN_USER}' listo."
+
+        echo "━━━ [3/4] Configurando Airflow Connections ━━━"
+        airflow connections delete 'datamart_dw' 2>/dev/null || true
+        airflow connections add 'datamart_dw' \
+          --conn-type postgres \
+          --conn-host datamart-db \
+          --conn-port 5432 \
+          --conn-login "${DW_DB_USER}" \
+          --conn-password "${DW_DB_PASSWORD}" \
+          --conn-schema "${DW_DB_NAME}"
+        echo "  ✓ Connection 'datamart_dw' creada"
+
+        airflow connections delete 'datamart_csv_source' 2>/dev/null || true
+        airflow connections add 'datamart_csv_source' \
+          --conn-type fs \
+          --conn-extra '{"path": "/opt/airflow/data"}'
+        echo "  ✓ Connection 'datamart_csv_source' creada"
+
+        echo "━━━ [4/4] Inicializando Airflow Variables ━━━"
+        airflow variables set 'csv_sales_filename'    'data.csv'
+        airflow variables set 'csv_history_filename'  'online_retail_II.xlsx'
+        airflow variables set 'pipeline_batch_size'   '10000'
+        airflow variables set 'pipeline_timezone'     'UTC'
+        airflow variables set 'reject_log_enabled'    'true'
+        airflow variables set 'data_path'             '/opt/airflow/data'
+        echo "  ✓ 6 variables inicializadas"
+
+        echo ""
+        echo "✅ Airflow init completado. Entorno listo."
+    environment:
+      <<: *airflow-common-env
+    restart: "no"
+
+  airflow-api-server:
+    <<: *airflow-common
+    container_name: airflow-api-server
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-db:
+        condition: service_healthy
+      datamart-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-db:
+        condition: service_healthy
+      datamart-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "DagProcessorJob", "--hostname", "$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "TriggererJob", "--hostname", "$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  airflow-db-data:
+  datamart-db-data:
+
+networks:
+  datamart-net:
+    driver: bridge

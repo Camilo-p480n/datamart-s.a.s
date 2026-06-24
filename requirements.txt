@@ -1,0 +1,18 @@
+# ============================================================
+#  DATAMART ETL — Dependencias Python
+# ============================================================
+
+# Base de datos
+psycopg2-binary==2.9.9
+
+# Manipulación de datos
+pandas==2.2.2
+numpy==1.26.4
+
+# Airflow providers
+apache-airflow-providers-postgres==5.12.0
+apache-airflow-providers-common-sql==1.14.0
+
+# Utilidades
+python-dotenv==1.0.1
+pytz==2024.1
